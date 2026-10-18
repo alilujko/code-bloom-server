@@ -20,27 +20,242 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 # Підключення до MongoDB береться зі змінних середовища:
 #   MONGODB_URI  — рядок підключення (локальний mongod або Atlas)
 #   MONGODB_DB   — назва бази
-MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+MONGODB_URI = os.environ.get("MONGODB_URI", "" if ON_VERCEL else "mongodb://localhost:27017")
 MONGODB_DB = os.environ.get("MONGODB_DB", "codebloom")
 
-#   USERS_FILE   — текстовий файл зі списком користувачів (оновлюється після реєстрації)
+# Fallback In-Memory implementation when MongoDB is not reachable
+def apply_projection(doc: dict, proj: dict | None) -> dict:
+    if not proj:
+        return dict(doc)
+    d = dict(doc)
+    has_exclusions = any(v in (0, False) for v in proj.values())
+    if has_exclusions:
+        for k, v in proj.items():
+            if v in (0, False) and k in d:
+                del d[k]
+        return d
+    out = {}
+    if proj.get("_id", 1) not in (0, False) and "_id" in d:
+        out["_id"] = d["_id"]
+    for k, v in proj.items():
+        if v and k in d and k != "_id":
+            out[k] = d[k]
+    return out
+
+
+def doc_matches(doc: dict, filt: dict | None) -> bool:
+    if not filt:
+        return True
+    for k, v in filt.items():
+        if k == "$or":
+            if not isinstance(v, list) or not any(doc_matches(doc, sub) for sub in v):
+                return False
+            continue
+        val = doc.get(k)
+        if isinstance(v, dict):
+            if "$in" in v:
+                in_vals = {str(x) for x in v["$in"]}
+                if str(val) not in in_vals and val not in v["$in"]:
+                    return False
+            continue
+        if isinstance(v, ObjectId) or isinstance(val, ObjectId):
+            if str(val) != str(v):
+                return False
+        elif val != v:
+            return False
+    return True
+
+
+def apply_update_doc(doc: dict, upd: dict):
+    if "$set" in upd:
+        for k, v in upd["$set"].items():
+            doc[k] = v
+    if "$unset" in upd:
+        for k in upd["$unset"]:
+            doc.pop(k, None)
+
+
+class InsertOneResult:
+    def __init__(self, inserted_id):
+        self.inserted_id = inserted_id
+
+
+class UpdateResult:
+    def __init__(self, modified_count):
+        self.modified_count = modified_count
+
+
+class DeleteResult:
+    def __init__(self, deleted_count):
+        self.deleted_count = deleted_count
+
+
+class MemoryCursor:
+    def __init__(self, docs: list, proj: dict | None = None):
+        self._docs = list(docs)
+        self._proj = proj
+
+    def sort(self, key_or_list, direction=1):
+        if isinstance(key_or_list, list):
+            for key, direct in reversed(key_or_list):
+                rev = direct in (-1, DESCENDING)
+                self._docs.sort(key=lambda d: str(d.get(key, "")), reverse=rev)
+        else:
+            rev = direction in (-1, DESCENDING)
+            self._docs.sort(key=lambda d: str(d.get(key_or_list, "")), reverse=rev)
+        return self
+
+    def limit(self, n: int):
+        self._docs = self._docs[:n]
+        return self
+
+    def __iter__(self):
+        for d in self._docs:
+            yield apply_projection(d, self._proj)
+
+    def __len__(self):
+        return len(self._docs)
+
+
+class MemoryCollection:
+    def __init__(self, name: str):
+        self.name = name
+        self._docs = []
+        self._unique_indexes = set()
+
+    def create_index(self, keys, unique=False, **kwargs):
+        if unique:
+            for k, _ in keys:
+                self._unique_indexes.add(k)
+
+    def insert_one(self, doc: dict):
+        d = dict(doc)
+        if "_id" not in d:
+            d["_id"] = ObjectId()
+        for field in self._unique_indexes:
+            if field in d:
+                val = d[field]
+                for existing in self._docs:
+                    if existing.get(field) == val:
+                        raise DuplicateKeyError(f"Duplicate key for field {field}: {val}")
+        self._docs.append(d)
+        doc["_id"] = d["_id"]
+        return InsertOneResult(d["_id"])
+
+    def find(self, filt=None, proj=None):
+        matched = [d for d in self._docs if doc_matches(d, filt)]
+        return MemoryCursor(matched, proj)
+
+    def find_one(self, filt=None, proj=None):
+        for d in self._docs:
+            if doc_matches(d, filt):
+                return apply_projection(d, proj)
+        return None
+
+    def update_one(self, filt, upd, upsert=False):
+        for d in self._docs:
+            if doc_matches(d, filt):
+                apply_update_doc(d, upd)
+                return UpdateResult(1)
+        if upsert:
+            new_doc = {}
+            if filt:
+                for k, v in filt.items():
+                    if not k.startswith("$") and not isinstance(v, dict):
+                        new_doc[k] = v
+            apply_update_doc(new_doc, upd)
+            self.insert_one(new_doc)
+            return UpdateResult(1)
+        return UpdateResult(0)
+
+    def update_many(self, filt, upd):
+        count = 0
+        for d in self._docs:
+            if doc_matches(d, filt):
+                apply_update_doc(d, upd)
+                count += 1
+        return UpdateResult(count)
+
+    def delete_one(self, filt):
+        for i, d in enumerate(self._docs):
+            if doc_matches(d, filt):
+                self._docs.pop(i)
+                return DeleteResult(1)
+        return DeleteResult(0)
+
+    def delete_many(self, filt):
+        before = len(self._docs)
+        self._docs = [d for d in self._docs if not doc_matches(d, filt)]
+        return DeleteResult(before - len(self._docs))
+
+    def count_documents(self, filt=None):
+        return sum(1 for d in self._docs if doc_matches(d, filt))
+
+    def aggregate(self, pipeline):
+        sorted_msgs = sorted(self._docs, key=lambda m: str(m.get("ts", "")), reverse=True)
+        grouped = {}
+        for m in sorted_msgs:
+            r = m.get("room")
+            if r and r not in grouped:
+                grouped[r] = {"_id": r, "author": m.get("author", ""), "text": m.get("text", "")}
+        return list(grouped.values())
+
+
+class MemoryStore:
+    def __init__(self):
+        self._collections = {}
+
+    def __getitem__(self, name: str) -> MemoryCollection:
+        if name not in self._collections:
+            self._collections[name] = MemoryCollection(name)
+        return self._collections[name]
+
+
+client = None
+db = None
+using_mongo = False
+
+def init_database():
+    global client, db, using_mongo
+    if MONGODB_URI:
+        try:
+            temp_client = MongoClient(
+                MONGODB_URI,
+                serverSelectionTimeoutMS=2500,
+                connectTimeoutMS=2500,
+                socketTimeoutMS=5000,
+            )
+            temp_client.admin.command("ping")
+            client = temp_client
+            db = client[MONGODB_DB]
+            using_mongo = True
+            print(f"[DB] Successfully connected to MongoDB ({MONGODB_DB})")
+            return db
+        except Exception as e:
+            print(f"[DB] MongoDB ({MONGODB_URI}) unreachable: {e}. Falling back to in-memory store.")
+    
+    using_mongo = False
+    print("[DB] Using high-performance in-memory fallback store")
+    return MemoryStore()
+
+
+_store = init_database()
+users = _store["users"]
+sessions = _store["sessions"]
+rooms = _store["rooms"]
+messages = _store["messages"]
+topics = _store["topics"]
+posts = _store["posts"]
+meta = _store["meta"]
+NO_AVATAR = {"avatar": 0}  # байти фото потрібні лише в /avatar/{nick}
+staff = _store["staff"]  # email -> роль ("admin" | "vip"), які видає адмін
+
+# USERS_FILE — текстовий файл зі списком користувачів (оновлюється після реєстрації)
 USERS_FILE = os.environ.get(
     "USERS_FILE",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "users.txt"),
 )
-
-# Таймаути: завислий запит до бази не тримає потік сервера вічно
-client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000, connectTimeoutMS=5000, socketTimeoutMS=10000)
-db = client[MONGODB_DB]
-users = db["users"]
-sessions = db["sessions"]
-rooms = db["rooms"]
-messages = db["messages"]
-topics = db["topics"]
-posts = db["posts"]
-meta = db["meta"]
-NO_AVATAR = {"avatar": 0}  # байти фото потрібні лише в /avatar/{nick}
-staff = db["staff"]  # email -> роль ("admin" | "vip"), які видає адмін
 
 # Головний адмін визначається за email (нікнейм можна змінювати в профілі)
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "artemsamaev25@gmail.com").lower()
@@ -52,23 +267,33 @@ ADMIN_EMAILS = {
 }
 
 def export_users():
-    # Нікнейм і email без паролів. Помилка запису не має ламати реєстрацію.
+    if ON_VERCEL:
+        return
     try:
         rows = list(users.find({}, {"_id": 0, "nick_name": 1, "email": 1}))
-        lines = [f"{i}. {u['nick_name']} — {u['email']}" for i, u in enumerate(rows, 1)]
+        lines = [f"{i}. {u.get('nick_name', '')} — {u.get('email', '')}" for i, u in enumerate(rows, 1)]
         with open(USERS_FILE, "w", encoding="utf-8") as f:
             f.write(f"Користувачів: {len(rows)}\n" + "\n".join(lines) + "\n")
-    except (OSError, PyMongoError):
+    except Exception:
         pass
 
-app = FastAPI()
+app = FastAPI(title="Code Bloom API", version="2.0.0")
 
+FRONTEND_ORIGINS = [
+    o.strip().rstrip("/")
+    for o in os.environ.get(
+        "FRONTEND_ORIGINS",
+        "https://code-bloom-woad.vercel.app,https://code-bloom-neon.vercel.app,http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=['*'],
-    allow_headers=['*']
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -268,29 +493,59 @@ def seed():
 
 @app.on_event("startup")
 def create_indexes():
-    # Унікальність нікнейму та email без урахування регістру.
     try:
         users.create_index([("nick_lower", ASCENDING)], unique=True)
         users.create_index([("email_lower", ASCENDING)], unique=True)
-    except PyMongoError:
-        # Сервер стартує і без бази; запити до неї повернуть 503.
+    except Exception:
         pass
     try:
         sessions.create_index([("token", ASCENDING)], unique=True)
         sessions.create_index([("created_at", ASCENDING)], expireAfterSeconds=60 * 60 * 24 * 30)
-        # Індекси під часті запити чату й форуму
         messages.create_index([("room", ASCENDING), ("ts", DESCENDING)])
         posts.create_index([("topic", ASCENDING), ("ts", ASCENDING)])
         topics.create_index([("ts", DESCENDING)])
-        seed()
-    except PyMongoError:
+    except Exception:
         pass
+    try:
+        seed()
+    except Exception as e:
+        print(f"[Seed warning]: {e}")
     export_users()
+
+
+# Пре-сід на старті модуля для serverless (Vercel)
+try:
+    seed()
+except Exception:
+    pass
 
 
 @app.get('/')
 def main():
-    return {"message": "Вітаю вас на потужному сервер"}
+    return {
+        "message": "Вітаю вас на потужному сервері Code Bloom!",
+        "status": "online",
+        "database": "mongodb" if using_mongo else "memory_store",
+        "mongodb_connected": using_mongo
+    }
+
+
+@app.get("/health")
+def health():
+    rooms_count = 0
+    topics_count = 0
+    try:
+        rooms_count = len(list(rooms.find()))
+        topics_count = len(list(topics.find()))
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "database": "mongodb" if using_mongo else "memory_store",
+        "mongodb_connected": using_mongo,
+        "rooms_count": rooms_count,
+        "topics_count": topics_count
+    }
 
 
 @app.post("/sign_up", status_code=201)
@@ -486,6 +741,11 @@ class TextIn(BaseModel):
     text: str
 
 
+class MessageIn(BaseModel):
+    text: str
+    reply_to: str | None = None  # id повідомлення, на яке відповідають
+
+
 class TopicIn(BaseModel):
     cat: str
     title: str
@@ -505,8 +765,12 @@ def clean(value: str, limit: int, what: str) -> str:
 def db_call(fn):
     try:
         return fn()
-    except PyMongoError:
-        raise HTTPException(503, "База даних недоступна")
+    except HTTPException:
+        raise
+    except PyMongoError as e:
+        if using_mongo:
+            raise HTTPException(503, "База даних недоступна")
+        raise HTTPException(500, f"Помилка сховища: {e}")
 
 
 # ---------- Чат ----------
@@ -539,9 +803,15 @@ def list_rooms(user: dict = Depends(optional_user)):
     return db_call(run)
 
 
-def msg_out(m, roles):
-    return {"id": str(m["_id"]), "author": m["author"], "text": m["text"], "ts": m["ts"],
-            "role": roles.get(m["author"].lower(), "user")}
+def msg_out(m, roles, by_id=None):
+    out = {"id": str(m["_id"]), "author": m["author"], "text": m["text"], "ts": m["ts"],
+           "role": roles.get(m["author"].lower(), "user"), "edited": m.get("edited_at")}
+    rid = m.get("reply_to")
+    if rid:
+        # Цитата береться з поточного стану: якщо оригінал змінили чи видалили, це видно
+        r = (by_id or {}).get(rid)
+        out["reply"] = {"id": rid, "author": r["author"], "text": r["text"][:200]} if r else {"id": rid, "deleted": True}
+    return out
 
 
 @app.get("/rooms/{room_id}/messages")
@@ -549,22 +819,70 @@ def room_messages(room_id: str, user: dict = Depends(optional_user)):
     def run():
         get_room(room_id, user)
         rows = list(messages.find({"room": room_id}).sort("ts", -1).limit(200))
+        by_id = {str(m["_id"]): m for m in rows}
+        # Оригінали відповідей, яких немає серед останніх 200, — одним запитом
+        missing = {m["reply_to"] for m in rows if m.get("reply_to") and m["reply_to"] not in by_id}
+        if missing:
+            ids = [ObjectId(x) for x in missing if ObjectId.is_valid(x)]
+            by_id.update({str(m["_id"]): m for m in messages.find({"_id": {"$in": ids}})})
         roles = roles_for({m["author"] for m in rows})
-        return [msg_out(m, roles) for m in reversed(rows)]
+        return [msg_out(m, roles, by_id) for m in reversed(rows)]
     return db_call(run)
 
 
 @app.post("/rooms/{room_id}/messages", status_code=201)
-def send_message(room_id: str, data: TextIn, user: dict = Depends(current_user)):
+def send_message(room_id: str, data: MessageIn, user: dict = Depends(current_user)):
     text = clean(data.text, 1000, "Повідомлення")
     ensure_can_write(user)
 
     def run():
         get_room(room_id, user)
         doc = {"room": room_id, "author": user["nick_name"], "text": text, "ts": now_iso()}
+        by_id = {}
+        if data.reply_to:
+            target = messages.find_one({"_id": oid(data.reply_to), "room": room_id})
+            if not target:
+                raise HTTPException(404, "Повідомлення, на яке ти відповідаєш, не знайдено")
+            doc["reply_to"] = str(target["_id"])
+            by_id[doc["reply_to"]] = target
         messages.insert_one(doc)
-        return msg_out(doc, {user["nick_lower"]: role_of(user)})
+        return msg_out(doc, {user["nick_lower"]: role_of(user)}, by_id)
     return db_call(run)
+
+
+def own_message(message_id: str, user: dict) -> dict:
+    m = messages.find_one({"_id": oid(message_id)})
+    if not m:
+        raise HTTPException(404, "Повідомлення не знайдено")
+    get_room(m["room"], user)
+    return m
+
+
+@app.patch("/messages/{message_id}")
+def edit_message(message_id: str, data: TextIn, user: dict = Depends(current_user)):
+    text = clean(data.text, 1000, "Повідомлення")
+    ensure_can_write(user)
+
+    def run():
+        m = own_message(message_id, user)
+        if m["author"] != user["nick_name"]:
+            raise HTTPException(403, "Редагувати можна лише свої повідомлення")
+        edited = now_iso()
+        messages.update_one({"_id": m["_id"]}, {"$set": {"text": text, "edited_at": edited}})
+        m.update(text=text, edited_at=edited)
+        return msg_out(m, {user["nick_lower"]: role_of(user)})
+    return db_call(run)
+
+
+@app.delete("/messages/{message_id}")
+def delete_message(message_id: str, user: dict = Depends(current_user)):
+    def run():
+        m = own_message(message_id, user)
+        if m["author"] != user["nick_name"] and not is_admin(user):
+            raise HTTPException(403, "Видаляти можна лише свої повідомлення")
+        messages.delete_one({"_id": m["_id"]})
+    db_call(run)
+    return {"ok": True}
 
 
 # ---------- Форум ----------
